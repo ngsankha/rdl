@@ -155,6 +155,9 @@ rule
     | single_type LESS type_expr_comma_list GREATER {
       result = RDL::Type::GenericType.new(val[0], *val[2])
     }
+    | single_type LBRACKET type_expr_comma_list RBRACKET {
+      result = RDL::Type::AstNode.new(:SELECT, RDL::Type::SingletonType.new(*val[2]))
+    }
     | LBRACE method_type RBRACE { result = val[1] }
     | LBRACKET type_expr_comma_list RBRACKET {
       result = RDL::Type::TupleType.new(*val[1])
