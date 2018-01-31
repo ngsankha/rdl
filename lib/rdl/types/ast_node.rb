@@ -1,8 +1,7 @@
 module RDL::Type
   class AstNode < Type
-    attr_reader :val
-    # attr_reader :nominal
-    attr_accessor :children
+    attr_reader :op, :val
+    attr_accessor :children, :curr, :parent
 
     @@cache = {}
     @@cache.compare_by_identity
@@ -21,8 +20,26 @@ module RDL::Type
     def initialize(op, val)
       @op = op
       @val = val
-      @children = {}
-      # @nominal = NominalType.new(val.class)
+      @children = []
+      @curr = self
+      @parent = nil
+    end
+
+    def root
+      unless self.parent
+        self
+      else
+        root(self.parent)
+      end
+    end
+
+    def insert(child)
+      @children << child
+      self.root.curr = child
+    end
+
+    def find_all(op)
+      @children.find_all { |obj| obj.op == op }
     end
 
     def ==(other)
@@ -45,7 +62,7 @@ module RDL::Type
     end
 
     def to_s
-      "AstNode[#{@val.to_s} [#{@children.to_s}]]"
+      [@op, @val.val, [@children.to_s]].inspect
     end
 
     def <=(other)
@@ -53,9 +70,7 @@ module RDL::Type
     end
 
     def member?(obj, *args)
-      t = RDL::Util.rdl_type obj
-      return t <= self if t
-      obj.equal?(@val)
+      raise "member? on AstNode called"
     end
 
     def instantiate(inst)
