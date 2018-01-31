@@ -1,27 +1,14 @@
+require 'pp'
+
 module RDL::Type
   class AstNode < Type
     attr_reader :op, :val
-    attr_accessor :children, :curr, :parent
-
-    @@cache = {}
-    @@cache.compare_by_identity
-
-    class << self
-      alias :__new__ :new
-    end
-
-    def self.new(op, val)
-      t = @@cache[val]
-      return t if t
-      t = self.__new__ op, val
-      return (@@cache[val] = t) # assignment evaluates to t
-    end
+    attr_accessor :children, :parent
 
     def initialize(op, val)
       @op = op
       @val = val
       @children = []
-      @curr = self
       @parent = nil
     end
 
@@ -34,12 +21,18 @@ module RDL::Type
     end
 
     def insert(child)
+      raise "AstNode expected" unless child.is_a? AstNode
       @children << child
-      self.root.curr = child
     end
 
     def find_all(op)
       @children.find_all { |obj| obj.op == op }
+    end
+
+    def find_one(op)
+      results = self.find_all(op)
+      raise "One node expected" unless results.size < 2
+      results[0]
     end
 
     def ==(other)
@@ -62,7 +55,7 @@ module RDL::Type
     end
 
     def to_s
-      [@op, @val.val, [@children.to_s]].inspect
+      self.pretty_inspect
     end
 
     def <=(other)
