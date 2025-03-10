@@ -27,4 +27,5 @@ EOF
   s.add_development_dependency 'coderay', '~>1.1', '>= 1.1.2'
   s.add_development_dependency 'rake', '~> 13.0.1'
   s.add_development_dependency 'minitest',  '~> 5.10'
+  s.add_development_dependency 'octokit'
 end

@@ -1,4 +1,5 @@
 # coding: utf-8
+require_relative 'cfg'
 module RDL::Typecheck
 
   class StaticTypeError < StandardError; end
@@ -404,10 +405,34 @@ module RDL::Typecheck
       else
         targs_dup = Hash[targs.map { |k, t| [k, t.copy] }] ## args can be mutated in method body. duplicate to avoid this. TODO: check on this
         @num_casts = 0
-        _, body_type, body_eff = tc(scope, Env.new(targs_dup), body)
+        g = RDL::Graph.new
+        _, body_type, body_eff = tc(scope, Env.new(targs_dup), body, g)
+        
+        if g.verify?
+          cur_bbl = g.peek_stack
+          if g.get_monotonic_pop_nodes.size > 0
+            cur_bbl = g.get_monotonic_pop_nodes[0]
+            if cur_bbl.get_expr_type == RDL::Graph::EXPR_TYPE[:retry]
+              cur_bbl = nil
+            end
+          end
+          begin_main_bbl = g.get_stack_node(RDL::Graph::EXPR_TYPE[:begin_main])
+          begin_main_bbl = g.get_graph_node(RDL::Graph::EXPR_TYPE[:begin_main]) if begin_main_bbl.nil?
+          count = g.get_count(RDL::Graph::EXPR_TYPE[:done])
+          done_bbl = RDL::Graph::BasicBlock.new([RDL::Globals.types[:pure]], RDL::Graph::EXPR_TYPE[:done], count)
+          g.add_node(done_bbl)
+          g.push_to_stack(done_bbl)
+          g.add_edge(cur_bbl, done_bbl) if cur_bbl
+          g.add_edge(begin_main_bbl, done_bbl)
+          puts g.to_s
+
+          g.to_dafny
+          # if verification fails, mention which meth and name of the method
+          g.set_verify(false)
+        end
       end
-      puts body_eff.inspect
-      puts ast
+      # puts body_eff.inspect
+      # puts ast
       error :bad_return_type, [body_type.to_s, type.ret.to_s], body unless body.nil? || meth == :initialize ||RDL::Type::Type.leq(body_type, type.ret, ast: ast)
       error :bad_return_effect, [body_eff.to_s, type.eff.to_s], body unless body.nil? || body_eff.nil? || meth == :initialize ||RDL::Type::Type.leq(body_eff, type.eff, ast: ast)
     }
@@ -578,8 +603,8 @@ module RDL::Typecheck
     cls.superclass.instance_method(m).owner
   end
 
-  def self.tc(scope, env, e)
-    _tc(scope, env, e)
+  def self.tc(scope, env, e, g=nil)
+    _tc(scope, env, e, g)
   rescue => exn
     raise exn unless RDL::Config.instance.continue_on_errors
 
@@ -594,14 +619,14 @@ module RDL::Typecheck
   # [+ e +] is the expression to type check
   # Returns [env', t], where env' is the type environment at the end of the expression
   # and t is the type of the expression. t is always canonical.
-  def self._tc(scope, env, e)
+  def self._tc(scope, env, e, g=nil)
     case e.type
     when :nil
-      [env, RDL::Globals.types[:nil]]
+      [env, RDL::Globals.types[:nil], [RDL::Globals.types[:pure]]]
     when :true
-      [env, RDL::Globals.types[:true]]
+      [env, RDL::Globals.types[:true], [RDL::Globals.types[:pure]]]
     when :false
-      [env, RDL::Globals.types[:false]]
+      [env, RDL::Globals.types[:false], [RDL::Globals.types[:pure]]]
     when :str, :string
       t = RDL::Config.instance.use_precise_string ? RDL::Type::PreciseStringType.new(e.children[0]) : RDL::Globals.types[:string]
       [env, t]
@@ -619,7 +644,7 @@ module RDL::Typecheck
       prec_str = []
       envi = env
       e.children.each { |ei|
-        envi, ti = tc(scope, envi, ei)
+        envi, ti = tc(scope, envi, ei, g)
         if RDL::Config.instance.use_precise_string
           if ei.type == :str || ei.type == :string
             ## for strings, just append the string itself
@@ -701,13 +726,13 @@ module RDL::Typecheck
       e.children.each { |p|
         # each child is a pair
         if p.type == :pair
-          envi, tleft = tc(scope, envi, p.children[0])
+          envi, tleft = tc(scope, envi, p.children[0], g)
           tlefts << tleft
-          envi, tright = tc(scope, envi, p.children[1])
+          envi, tright = tc(scope, envi, p.children[1], g)
           trights << tright
           is_fh = false unless tleft.is_a?(RDL::Type::SingletonType)
         elsif p.type == :kwsplat
-          envi, tkwsplat = tc(scope, envi, p.children[0])
+          envi, tkwsplat = tc(scope, envi, p.children[0], g)
 
           if tkwsplat.is_a? RDL::Type::FiniteHashType
             tkwsplat.cant_promote! # must remain finite hash
@@ -756,8 +781,19 @@ module RDL::Typecheck
       x = e.children[0]
       # if local var, lhs is bound to nil before assignment is executed! only matters in type checking for locals
       env = env.bind(x, RDL::Globals.types[:nil]) if ((e.type == :lvasgn) && (not (env.has_key? x)))
-      envright, tright, teff = tc(scope, env, e.children[1])
+      envright, tright, teff = tc(scope, env, e.children[1], g)
       ret = tc_vasgn(scope, envright, e.type, x, tright, e)
+
+      # vasgn does not need a new basic block
+      # get the last basic block from the graph using the stack
+      if g
+        cur_bbl = g.peek_stack
+        # puts "Current basic block (lvasgn): #{bbl}"
+        if !cur_bbl.nil?
+          cur_bbl.add_effect(teff)
+        end
+      end
+      
       ret + [teff]
     when :masgn
       # (masgn (mlhs (Xvasgn var-name) ... (Xvasgn var-name)) rhs)
@@ -955,13 +991,15 @@ module RDL::Typecheck
       return tc_instantiate!(scope, env, e)  if is_RDL(e.children[0]) && e.children[1] == :instantiate!
       envi = env
       tactuals = []
+      effactuals = [RDL::Globals.types[:pure]]
       block = scope[:block]
       map_case = false
       e_map_case = ti_map_case = nil
       scope_merge(scope, block: nil, break: env, next: env) { |sscope|
         e.children[2..-1].each { |ei|
           if ei.type == :splat
-            envi, ti = tc(sscope, envi, ei.children[0])
+            envi, ti, effi = tc(sscope, envi, ei.children[0], g)
+            effactuals.push(*effi)
             if ti.is_a? RDL::Type::TupleType
               tactuals.concat ti.params
             elsif ti.is_a?(RDL::Type::GenericType) && ti.base == RDL::Globals.types[:array]
@@ -984,7 +1022,8 @@ module RDL::Typecheck
             end
           elsif ei.type == :block_pass
             raise RuntimeError, "impossible to pass block arg and literal block" if scope[:block]
-            envi, ti = tc(sscope, envi, ei.children[0])
+            envi, ti, effi = tc(sscope, envi, ei.children[0], g)
+            effactuals.push(*effi)
             # convert using to_proc if necessary
             if (e.children[1] == :map) || e.children[1] == :sum || e.children[1] == :keep_if
               ## block_pass calling map is a weird case:
@@ -997,26 +1036,41 @@ module RDL::Typecheck
               e_map_case = ei
               ti_map_case = ti
             else
-              envi, ti = tc_send(sscope, envi, ti, :to_proc, [], nil, ei) unless ti.is_a? RDL::Type::MethodType
+              envi, ti, effi = tc_send(sscope, envi, ti, :to_proc, [], nil, ei) unless ti.is_a? RDL::Type::MethodType
+              effactuals.push(*effi)
               block = [ti, ei]
             end
           else
-            envi, ti = tc(sscope, envi, ei)
+            envi, ti, effi = tc(sscope, envi, ei, g)
             tactuals << ti
+            effactuals.push(*effi)
           end
         }
-        envi, trecv = if e.children[0].nil? then [envi, envi[:self]] else tc(sscope, envi, e.children[0]) end # if no receiver, self is receiver
+        envi, trecv, effrecv = if e.children[0].nil? then [envi, envi[:self], RDL::Globals.types[:pure]] else tc(sscope, envi, e.children[0], g) end # if no receiver, self is receiver
+        effactuals.push(*effrecv)
 
         if map_case && trecv.is_a?(RDL::Type::GenericType)
           #raise "Expected GenericType, got #{trecv}." unless trecv.is_a?(RDL::Type::GenericType)
           trecv.is_a?(RDL::Type::GenericType)
-          _, ti_map_case = tc_send(sscope, Env.new({ self: trecv.params[0] }), ti_map_case, :to_proc, [], nil, e_map_case)
+          _, ti_map_case, effi_map_case = tc_send(sscope, Env.new({ self: trecv.params[0] }), ti_map_case, :to_proc, [], nil, e_map_case)
+          effactuals.push(*effi_map_case)
           map_block_type = RDL::Type::MethodType.new([trecv.params[0]], nil, ti_map_case.canonical.ret)
           block = [map_block_type, e_map_case]
         end
         envres, tres, teff = tc_send(sscope, envi, trecv, e.children[1], tactuals, block, e)
-        puts "tc_send: #{teff}"
-        [envres, tres.canonical, teff.canonical]
+        # puts "tc_send: #{teff}"
+        effactuals.push(*teff)
+        # puts "effactuals: #{effactuals}"
+        
+        # CFA
+        if g
+          cur_bbl = g.peek_stack 
+          # puts "Current basic block (send): #{cur_bbl}"
+          if !cur_bbl.nil?
+            cur_bbl.add_effect(effactuals)
+          end
+        end
+        [envres, tres.canonical, RDL::Type::UnionType.new(*effactuals).canonical]
       }
     when :yield
       # very similar to send except the callee is the method's block
@@ -1072,14 +1126,136 @@ RUBY
     #     [a1, RDL::Globals.types[:bool]]
     #   end
     when :if
-      envi, tguard = tc(scope, env, e.children[0]) # guard; any type allowed
+      effs = [RDL::Globals.types[:pure]]
+      # puts "Node if: #{e.children[0]}"
+      # puts "Node if then: #{e.children[1]}"
+      envi, tguard, eff_guard = tc(scope, env, e.children[0], g) # guard; any type allowed
+      effs.push(*eff_guard)
+
+      # puts " Eff guard: #{eff_guard}"
+ 
+      cur_bbl = g.peek_stack
+      # puts "\n---Stack--- if" 
+      # puts g.get_stack
+      # puts "Current basic block (if): #{cur_bbl}"
+      count = g.get_count(RDL::Graph::EXPR_TYPE[:if_head])
+      if_head = RDL::Graph::BasicBlock.new(eff_guard.dup, RDL::Graph::EXPR_TYPE[:if_head], count)
+      g.add_node(if_head)
+      g.add_edge(cur_bbl, if_head)
+      g.push_to_stack(if_head)
       # always type check both sides
-      envleft, tleft = if e.children[1].nil? then [envi, RDL::Globals.types[:nil]] else tc(scope, envi, e.children[1]) end # then
-      envright, tright = if e.children[2].nil? then [envi, RDL::Globals.types[:nil]] else tc(scope, envi, e.children[2]) end # else
+      if_then_retry = false
+      if_else_retry = false
+      if !e.children[1].nil?
+        count = g.get_count(RDL::Graph::EXPR_TYPE[:if_then])
+        if_then = RDL::Graph::BasicBlock.new([RDL::Globals.types[:pure]], RDL::Graph::EXPR_TYPE[:if_then], count)
+        g.add_node(if_then)
+        g.add_edge(if_head, if_then)
+        g.push_to_stack(if_then)
+      end
+      envleft, tleft, eff_left = if e.children[1].nil? then [envi, RDL::Globals.types[:nil], RDL::Type::UnionType.new(*effs).canonical] else tc(scope, envi, e.children[1], g) end # then
+      effs.push(*eff_left)
+
+      # puts "\n---Stack--- after if_then" 
+      # puts g.get_stack
+    
+      if !e.children[1].nil? 
+        if_then = g.get_stack_node(RDL::Graph::EXPR_TYPE[:if_then])
+        if_then.add_effect(eff_left)
+        node = g.pop_from_stack
+        if g.get_monotonic_pop_nodes.size > 0
+          cur_bbl = g.get_monotonic_pop_nodes[0]
+          if_then_retry = true if cur_bbl.get_expr_type == RDL::Graph::EXPR_TYPE[:retry]
+          g.remove_first_monotonic_pop_node if if_then_retry
+        end
+      end
+      last_if_then_bbl = g.get_monotonic_pop_nodes[0] if g.get_monotonic_pop_nodes.size > 0
+      # puts "\nLast if then bbl:"
+      # puts last_if_then_bbl
+
+      if !e.children[2].nil?
+        count = g.get_count(RDL::Graph::EXPR_TYPE[:if_else])
+        if_else = RDL::Graph::BasicBlock.new([RDL::Globals.types[:pure]], RDL::Graph::EXPR_TYPE[:if_else], count)
+        g.add_node(if_else)
+        g.add_edge(if_head, if_else)
+        g.push_to_stack(if_else)
+      end
+
+      envright, tright, eff_right = if e.children[2].nil? then [envi, RDL::Globals.types[:nil], RDL::Type::UnionType.new(*effs).canonical] else tc(scope, envi, e.children[2], g) end # else
+      effs.push(*eff_right)
+     
+      # puts "\n---Stack--- after if_else" 
+      # puts g.get_stack
+
+      if !e.children[2].nil? 
+        if_else = g.get_stack_node(RDL::Graph::EXPR_TYPE[:if_else])
+        if_else.add_effect(eff_right)
+        node = g.pop_from_stack
+        if g.get_monotonic_pop_nodes.size > 0
+          cur_bbl = g.get_monotonic_pop_nodes[0]
+          if_else_retry = true if cur_bbl.get_expr_type == RDL::Graph::EXPR_TYPE[:retry]
+          g.remove_first_monotonic_pop_node if if_else_retry
+        end
+      end
+
+      last_if_else_bbl = g.get_monotonic_pop_nodes[0] if g.get_monotonic_pop_nodes.size > 0
+      # puts "\nLast if else bbl:"
+      # puts last_if_else_bbl
+      
+      g.pop_from_stack
+
+      count = g.get_count(RDL::Graph::EXPR_TYPE[:join])
+      join = RDL::Graph::BasicBlock.new([RDL::Globals.types[:pure]], RDL::Graph::EXPR_TYPE[:join], count)
+
+      # case 1: both then and else are present and no retry in either
+      if !e.children[1].nil? && !e.children[2].nil? && !if_then_retry && !if_else_retry
+        g.add_node(join)
+        g.join_nodes(last_if_then_bbl, last_if_else_bbl, join)
+        # join.add_effect(effs) 
+      # case 2: then is present and no retry in then
+      elsif !e.children[1].nil? && !if_then_retry
+        g.add_node(join)
+        # case 2.1: else is present and retry in else
+        if !e.children[2].nil?
+          g.add_edge(last_if_then_bbl, join)
+          # join.add_effect(eff_left)
+          g.push_to_stack(join)
+        # case 2.2: else is not present
+        else
+          g.join_nodes(last_if_then_bbl, if_head, join)
+          # join.add_effect(eff_left)
+          # join.add_effect(eff_guard)
+        end
+      # case 3: then is present and retry in then
+      elsif !e.children[1].nil? && if_then_retry
+        g.add_node(join)
+        g.add_edge(if_head, join)
+        # join.add_effect(eff_guard)
+        g.push_to_stack(join)
+      # case 4: else is present and no retry in else
+      elsif !e.children[2].nil? && !if_else_retry
+        g.add_node(join)
+        # case 4.1: then is present and retry in then
+        if !e.children[1].nil?
+          g.add_edge(last_if_else_bbl, join)
+          # join.add_effect(eff_right)
+          g.push_to_stack(join)
+        # case 4.2: then is not present
+        else
+          g.join_nodes(last_if_else_bbl, if_head, join)
+          # join.add_effect(eff_right)
+          # join.add_effect(eff_guard)
+        end
+      end
+
+      # puts "----------------- Stack -----------------"
+      # puts g.get_stack
+      # puts "----------------- Stack -----------------"
+
       if tguard.is_a? RDL::Type::SingletonType
-        if tguard.val then [envleft, tleft] else [envright, tright] end
+        if tguard.val then [envleft, tleft, RDL::Type::UnionType.new(*effs).canonical] else [envright, tright, RDL::Type::UnionType.new(*effs).canonical] end
       else
-        [Env.join(e, envleft, envright), RDL::Type::UnionType.new(tleft, tright).canonical]
+        [Env.join(e, envleft, envright), RDL::Type::UnionType.new(tleft, tright).canonical, RDL::Type::UnionType.new(*effs).canonical]
       end
     when :case
       envi = env
@@ -1264,15 +1440,31 @@ RUBY
       if e.children[0]
         tkw_name = ('t' + e.type.to_s).to_sym
         error :kw_arg_not_allowed, [e.type], e unless scope.has_key? tkw_name
-        env, tkw = tc(scope, env, e.children[0])
+        env, tkw = tc(scope, env, e.children[0], g)
         scope[tkw_name] = RDL::Type::UnionType.new(scope[tkw_name], tkw)
       end
       scope[e.type] = Env.join(e, scope[e.type], env)
+      # CFA
+      if g
+        cur_bbl = g.peek_stack
+        # puts "Current basic block (retry): #{cur_bbl}"
+        begin_bbl = g.get_retryable_begin_node
+        if !begin_bbl.nil?
+          g.add_edge(cur_bbl, begin_bbl)
+          # Add a dummy retry node to the stack to indicate that we are retrying
+          # Wherever the control flow goes after this will know to not join it to the next node
+          count = g.get_count(RDL::Graph::EXPR_TYPE[:retry])
+          retry_bbl = RDL::Graph::BasicBlock.new([RDL::Globals.types[:pure]], RDL::Graph::EXPR_TYPE[:retry], count)
+          g.push_to_stack(retry_bbl)
+          g.pop_from_stack # adds to the monotonic pop nodes
+        end
+      end
+
       [env, RDL::Globals.types[:bot]]
     when :return
       # TODO return in lambda returns from lambda and not outer scope
       if e.children[0]
-         env1, t1 = tc(scope, env, e.children[0])
+         env1, t1 = tc(scope, env, e.children[0], g)
       else
          env1, t1 = [env, RDL::Globals.types[:nil], [:+, :+]]
       end
@@ -1282,13 +1474,31 @@ RUBY
       envi = env
       ti = nil
       effi = [RDL::Globals.types[:pure]]
+      
+      if !g.visited_begin_secondary?
+        cur_bbl = g.peek_stack
+        if !cur_bbl.nil?
+        # puts "Current basic block (begin_secondary): #{cur_bbl}"
+          count = g.get_count(RDL::Graph::EXPR_TYPE[:begin_secondary])
+          begin_secondary_bbl = RDL::Graph::BasicBlock.new([RDL::Globals.types[:pure]], RDL::Graph::EXPR_TYPE[:begin_secondary], count)
+          g.add_node(begin_secondary_bbl)
+          g.add_edge(cur_bbl, begin_secondary_bbl)
+          g.push_to_stack(begin_secondary_bbl)
+        end
+      end
+
+      # puts "Begin children #{e.children}"
+
       e.children.each { |ei|
-        envi, ti, eff = tc(scope, envi, ei)
-        puts "Node: #{ei.type}"
-        puts "Type: #{ti}"
-        puts "Effect: #{eff}"
-        effi << eff
+        envi, ti, eff = tc(scope, envi, ei, g)
+        # puts "Node: #{ei.type}"
+        # puts "Type: #{ti}"
+        # puts "Effect: #{eff}"
+        effi.push(*eff)
       }
+
+      g.pop_from_stack
+
       [envi, ti, RDL::Type::UnionType.new(*effi).canonical]
     when :ensure
       # (ensure main-body ensure-body)
@@ -1303,35 +1513,75 @@ RUBY
       # is raised during main-body's execution before those varibles are assigned to.
       # similarly, local variables assigned in resbody will be initialized to nil even if the resbody
       # is never triggered
+       
+      # CFA
+      # retryable expression is the body of the rescue
+      # start numbering the rescue and begin-secondary, begin-retryable
+      # a set from type of node to the count of the node
       scope_merge(scope, retry: env, exn: nil) { |rscope|
         begin
           old_retry = rscope[:retry]
-          env_body, tbody = tc(rscope, rscope[:retry], e.children[0])
+          eff_res = [RDL::Globals.types[:pure]]
+          g.set_verify(true)
+          env_body, tbody, eff_body = tc(rscope, rscope[:retry], e.children[0], g)
+          if !g.visited_begin_main?
+            count = g.get_count(RDL::Graph::EXPR_TYPE[:begin_main])
+            begin_main_bbl = RDL::Graph::BasicBlock.new([RDL::Globals.types[:pure]], RDL::Graph::EXPR_TYPE[:begin_main], count)
+            begin_main_bbl.add_effect(eff_body)
+            g.add_node(begin_main_bbl)
+            g.add_to_scope(begin_main_bbl)
+            g.push_to_stack(begin_main_bbl)
+            g.set_begin_visited_main(true)
+            g.set_begin_visited_secondary(false)
+          else
+            cur_bbl = g.peek_stack
+            # puts "Current basic block (begin_with_rescue creation before): #{cur_bbl}"
+            count = g.get_count(RDL::Graph::EXPR_TYPE[:begin_with_rescue])
+            begin_with_rescue_bbl = RDL::Graph::BasicBlock.new([RDL::Globals.types[:pure]], RDL::Graph::EXPR_TYPE[:begin_with_rescue], count)
+            begin_with_rescue_bbl.add_effect(eff_body)
+            g.add_node(begin_with_rescue_bbl)
+            g.add_edge(cur_bbl, begin_with_rescue_bbl)
+            g.add_to_scope(begin_with_rescue_bbl)
+            g.push_to_stack(begin_with_rescue_bbl)
+          end
+
+          cur_bbl = g.peek_stack
+          count = g.get_count(RDL::Graph::EXPR_TYPE[:rescue])
+          rescue_bbl = RDL::Graph::BasicBlock.new([RDL::Globals.types[:pure]], RDL::Graph::EXPR_TYPE[:rescue], count)
+          g.add_node(rescue_bbl)
+          g.add_edge(cur_bbl, rescue_bbl)
+          eff_res << eff_body
           tres = [tbody] # note throw away inferred types from previous iterations---should be okay since should be monotonic
           env_res = [env_body]
+          g.push_to_stack(rescue_bbl)
           if rscope[:exn]
             e.children[1..-2].each { |resbody|
-              env_resbody, tresbody = tc(rscope, rscope[:exn], resbody)
+              env_resbody, tresbody, eff_resbody = tc(rscope, rscope[:exn], resbody, g)
               tres << tresbody
               env_res << env_resbody
+              eff_res << eff_resbody
             }
             if e.children[-1]
-              env_else, telse = tc(rscope, rscope[:exn], e.children[-1])
+              env_else, telse, eff_else = tc(rscope, rscope[:exn], e.children[-1], g)
               tres << telse
               env_res << env_else
+              eff_res << eff_else
             end
           end
         end until old_retry == rscope[:retry]
         # TODO: variables newly bound in *env_res should be unioned with nil
-        [Env.join(e, *env_res), RDL::Type::UnionType.new(*tres).canonical]
+        g.pop_from_stack
+        g.remove_from_scope
+        [Env.join(e, *env_res), RDL::Type::UnionType.new(*tres).canonical, RDL::Type::UnionType.new(*eff_res).canonical]
       }
     when :resbody
       # (resbody (array exns) (lvasgn var) rescue-body)
       envi = env
       texns = []
+      eff_fin = [RDL::Globals.types[:pure]]
       if e.children[0]
         e.children[0].children.each { |exn|
-          envi, texn = tc(scope, envi, exn)
+          envi, texn = tc(scope, envi, exn, g)
           error :exn_type, [], exn unless texn.is_a?(RDL::Type::SingletonType) && (texn.val.is_a?(Class) || texn.val.is_a?(Module))
           texns << RDL::Type::NominalType.new(texn.val)
         }
@@ -1341,8 +1591,14 @@ RUBY
       if e.children[1]
         envi, _ = tc_vasgn(scope, envi, :lvasgn, e.children[1].children[0], RDL::Type::UnionType.new(*texns), e.children[1])
       end
-      env_fin, t_fin = if e.children[2].nil? then [envi, RDL::Globals.types[:nil]] else tc(scope, envi, e.children[2]) end
-      [env_fin, t_fin]
+      # puts "Node resbody: #{e.children[2].type}"
+      cur_bbl = g.peek_stack
+      # puts "Current basic block (resbody before): #{cur_bbl}"
+      env_fin, t_fin, eff_fin = if e.children[2].nil? then [envi, RDL::Globals.types[:nil]] else tc(scope, envi, e.children[2], g) end
+      cur_bbl = g.peek_stack
+      # puts "Current basic block (resbody after): #{cur_bbl}"
+      cur_bbl.add_effect(eff_fin)
+      [env_fin, t_fin, RDL::Type::UnionType.new(*eff_fin).canonical]
     when :super
       envi = env
       tactuals = []
@@ -1508,7 +1764,8 @@ RUBY
         }
       end
       # name is not useful here
-      tc_send(scope, envi, trecv, meth, [*typs, tright], nil, e) # call receiver.meth(other args, tright)
+      envres, tres, teff = tc_send(scope, envi, trecv, meth, [*typs, tright], nil, e) # call receiver.meth(other args, tright)
+      [envres, tres.canonical, RDL::Type::UnionType.new(*effs, teff).canonical]
     else
       raise RuntimeError, "unknown kind #{kind}"
     end
@@ -1648,6 +1905,7 @@ RUBY
             tarms = t.is_a?(RDL::Type::UnionType) ? t.types : [t]
             tarms.each { |t|
               env, ts, effs = tc_send_one_recv(scope, env, t, meth, tactuals, block, e, op_asgn, union)
+              teffs.push(*effs)
               choice_hash[num] = RDL::Type::UnionType.new(*ts).canonical
             }
           rescue StaticTypeError => err
@@ -1671,7 +1929,7 @@ RUBY
       # TODO: envs is all possible different orders
 
       trets.concat(ts)
-      teffs.concat(effs)
+      teffs.push(*effs)
     }
     trets.map! {|t| (t.is_a?(RDL::Type::AnnotatedArgType) || t.is_a?(RDL::Type::BoundArgType)) ? t.type : t}
     return [env, RDL::Type::UnionType.new(*trets), RDL::Type::UnionType.new(*teffs)]
@@ -1690,9 +1948,9 @@ RUBY
     tactuals.each { |t| puts t }
     puts "----------------------"
 =end
-    puts 
-    puts "==="
-    puts "Meth name: #{meth}"
+    # puts 
+    # puts "==="
+    # puts "Meth name: #{meth}"
     if (trecv == RDL::Globals.types[:array])
       trecv = RDL::Type::GenericType.new(RDL::Globals.types[:array], RDL::Globals.types[:bot])
     elsif (trecv == RDL::Globals.types[:hash])
@@ -1721,7 +1979,7 @@ RUBY
           self_inst = trecv
         end
         ts = lookup(scope, trecv_lookup, meth_lookup, e)
-        puts ts
+        # puts ts
         ts = [RDL::Type::MethodType.new([], nil, RDL::Type::NominalType.new(trecv.val))] if init && (ts.nil?) # there's always a nullary new if initialize is undefined
         error :no_singleton_method_type, [trecv.val, meth], e unless ts
         inst = {self: self_inst}
@@ -1760,7 +2018,7 @@ RUBY
     when RDL::Type::NominalType
       ts = lookup(scope, trecv.name, meth, e)
       
-      puts ts
+      # puts ts
       unless ts
         klass = RDL::Util.to_class(scope[:klass])
         if klass.class == Module
@@ -1980,7 +2238,7 @@ RUBY
               got_match = true
             elsif !block_mismatch
               trets_tmp << (current_ret = (tmeth.ret.instantiate(tmeth_inst))) # found a match for this subunion; add its return type to trets_tmp
-              puts "tmeth.eff: #{tmeth.eff}"
+              # puts "tmeth.eff: #{tmeth.eff}"
               teffs_tmp << tmeth.eff
               got_match = true
               if comp_type && RDL::Config.instance.check_comp_types && !union
@@ -2034,7 +2292,6 @@ RUBY
     ## Down here EITHER: apply all deferred constraints, continue with trets OR turn choices into ChoiceTypes, apply those deferred constraints, turn trets into [ret_choice_type]
 
     if arg_choices.empty?
-      puts "Here"
       apply_deferred_constraints(deferred_constraints, e) if !deferred_constraints.empty?
     else
       new_dcs = []
@@ -2084,8 +2341,8 @@ RUBY
       error :arg_type_single_receiver_error, [name, meth, msg], e
     end
     # TODO: issue warning if trets.size > 1 ?
-    puts "trets: #{trets}"
-    puts "teffs: #{teffs}"
+    # puts "trets: #{trets}"
+    # puts "teffs: #{teffs}"
     return [env, trets, teffs]
   end
 

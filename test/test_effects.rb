@@ -19,6 +19,36 @@ class TestEffects < Minitest::Test
     f.close
   end
 
+  type :test_rescue, '() -> %any [open or close]', typecheck: :effects
+  def test_rescue
+    begin
+      raise "error"
+    rescue
+      f = File.open('test')
+      f.close
+    end
+  end
+
+  type :test_if, '() -> %any [open or write or close]', typecheck: :effects
+  def test_if
+    if true
+      f = File.open('test')
+    else
+      puts "no file"
+      do_io()
+    end
+  end
+
+  type :foo, '() -> %any [open]', typecheck: :effects
+  def foo
+    f = File.open('test')
+  end
+
+  type :test_functioncall, '() -> %any [open]', typecheck: :effects
+  def test_functioncall
+    foo()
+  end
+
   def test_effects
     RDL.do_typecheck :effects
   end
